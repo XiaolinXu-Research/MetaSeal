@@ -2,7 +2,7 @@
 
 Official implementation of **MetaSeal: Defending Against Image Attribution Forgery Through Content-Dependent Cryptographic Watermarks** (TMLR 2026).
 
-MetaSeal is a watermarking framework for image attribution that combines semantic binding, cryptographic signatures, and robust secret recovery.
+MetaSeal is an image attribution watermarking framework that prevents misattribution by cryptographically binding watermarks to image semantics, enabling forgery-resistant and publicly verifiable attribution.
 
 ## Highlights
 
