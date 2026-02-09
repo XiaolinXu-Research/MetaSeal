@@ -1,0 +1,259 @@
+#!/usr/bin/env python
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import math
+import numpy as np
+import sys
+from skimage.metrics import structural_similarity as ssim
+sys.path.append('./')
+sys.path.append('../')
+from scripts.model.model import *
+import scripts.config as c
+from tensorboardX import SummaryWriter
+import scripts.dataset as datasets
+import viz
+import modules.Unet_common as common
+import warnings
+from FIN.utils.jpeg import JpegSS, JpegTest
+
+warnings.filterwarnings("ignore")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+CUDA_LAUNCH_BLOCKING=1
+
+
+def gauss_noise(shape):
+    noise = torch.zeros(shape).to(device)
+    for i in range(noise.shape[0]):
+        noise[i] = torch.randn(noise[i].shape).to(device)
+    return noise
+
+def binary_noise(shape):
+    noise = torch.zeros(shape).to(device)
+    for i in range(noise.shape[0]):
+        # Generate binary noise with values 0 or 1
+        noise[i] = torch.randint(0, 2, noise[i].shape).float().to(device)
+
+    return noise
+
+def guide_loss(output, bicubic_image):
+    loss_fn = nn.MSELoss(reduce=True, size_average=False)
+    loss = loss_fn(output, bicubic_image)
+    return loss.to(device)
+
+def reconstruction_loss(rev_input, input):
+    loss_fn = nn.BCEWithLogitsLoss(reduce=True, size_average=False)
+    loss = loss_fn(rev_input, input)
+    return loss.to(device)
+
+def low_frequency_loss(ll_input, gt_input):
+    loss_fn = nn.MSELoss(reduce=True, size_average=False)
+    loss = loss_fn(ll_input, gt_input)
+    return loss.to(device)
+
+# Network parameter count
+def get_parameter_number(net):
+    total_num = sum(p.numel() for p in net.parameters())
+    trainable_num = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    return {'Total': total_num, 'Trainable': trainable_num}
+
+def computePSNR(origin, pred):
+    origin = np.array(origin)
+    origin = origin.astype(np.float32)
+    pred = np.array(pred)
+    pred = pred.astype(np.float32)
+    mse = np.mean((origin / 1.0 - pred / 1.0) ** 2)
+    if mse < 1.0e-10:
+        return 100
+    return 10 * math.log10(255.0 ** 2 / mse)
+
+def load(name):
+    state_dicts = torch.load(name)
+    network_state_dict = {k: v for k, v in state_dicts['net'].items() if 'tmp_var' not in k}
+    net.load_state_dict(network_state_dict, strict=False)
+    try:
+        optim.load_state_dict(state_dicts['opt'])
+    except:
+        print('Cannot load optimizer for some reason or other')
+
+#####################
+# Model initialize: #
+#####################
+net = Model()
+net.to(device)
+init_model(net)
+net = torch.nn.DataParallel(net, device_ids=c.device_ids)
+para = get_parameter_number(net)
+print(para)
+params_trainable = list(filter(lambda p: p.requires_grad, net.parameters()))
+
+# Use Adam optimizer
+optim = optim.Adam(params_trainable, lr=c.lr, betas=c.betas, eps=1e-6, weight_decay=c.weight_decay)
+weight_scheduler = torch.optim.lr_scheduler.StepLR(optim, c.weight_step, gamma=c.gamma)
+
+
+# more noise layers can be added like HiDDeN: https://github.com/ando-khachatryan/HiDDeN/tree/master/noise_layers
+noise_layer = JpegSS(80)
+test_noise_layer = JpegTest(80)
+
+dwt = common.DWT()
+iwt = common.IWT()
+
+
+trainloader = datasets.get_data_loaders(c, c.batch_size, c.cropsize, "train")
+testloader = datasets.get_data_loaders(c, c.batchsize_val, c.cropsize_val, "val")
+
+if c.train_next:
+    load(c.MODEL_PATH + c.suffix)
+
+
+try:
+    writer = SummaryWriter(comment='metaseal', filename_suffix="steg")
+
+    for i_epoch in range(c.epochs):
+        i_epoch = i_epoch + c.trained_epoch + 1
+        loss_history = []
+
+        #################
+        #     train:    #
+        #################
+
+        for i_batch, (data, secret) in enumerate(trainloader):
+            data = data.to(device)
+            secret = secret.to(device)
+            cover_input = dwt(data)
+            secret_input = dwt(secret)
+
+            input_img = torch.cat((cover_input, secret_input), 1)
+
+            #################
+            #    forward:   #
+            #################
+            output = net(input_img)
+            output_steg = output.narrow(1, 0, 4 * c.channels_in)
+            output_z = output.narrow(1, 4 * c.channels_in, output.shape[1] - 4 * c.channels_in)
+            steg_img = iwt(output_steg).to(device)
+            stego_noise_img = noise_layer(steg_img.clone()).to(device)
+
+            #################
+            #   backward:   #
+            #################
+
+            output_z_tr = gauss_noise(output_z.shape).to(device)
+            output_rev = torch.cat((dwt(stego_noise_img), output_z_tr), 1)
+            output_image = net(output_rev, rev=True)
+
+            secret_rev = output_image.narrow(1, 4 * c.channels_in, output_image.shape[1] - 4 * c.channels_in)
+            secret_rev = iwt(secret_rev).to(device)
+
+            #################
+            #     loss:     #
+            #################
+            g_loss = guide_loss(steg_img.to(device), data.to(device))
+
+
+            r_loss = reconstruction_loss(secret_rev, secret)
+            steg_low = output_steg.narrow(1, 0, c.channels_in)
+            cover_low = cover_input.narrow(1, 0, c.channels_in)
+            l_loss = low_frequency_loss(steg_low.to(device), cover_low.to(device))
+            
+            total_loss = c.lamda_reconstruction * r_loss + c.lamda_guide * g_loss + c.lamda_low_frequency * l_loss
+            total_loss.backward()
+            optim.step()
+            optim.zero_grad()
+
+            loss_history.append([total_loss.item(), g_loss.item(), r_loss.item(), l_loss.item(), 0.])
+
+        # Print losses in one row
+        print(f"Epoch [{i_epoch}/{c.epochs}] | Total Loss: {total_loss.item():.4f} | Guide Loss: {g_loss.item():.4f} | Reconstruction Loss: {r_loss.item():.4f} | Low Frequency Loss: {l_loss.item():.4f}")
+
+
+        epoch_losses = np.mean(np.array(loss_history), axis=0)
+        epoch_losses[-1] = np.log10(optim.param_groups[0]['lr'])
+
+        #################
+        #     val:    #
+        #################
+        if i_epoch % c.val_freq == 0:
+            with torch.no_grad():
+                psnr_s = []
+                psnr_c = []
+                net.eval()
+                for x,y in testloader:
+                    cover = x.to(device)
+                    secret = y.to(device)
+                    cover_input = dwt(cover)
+                    secret_input = dwt(secret)
+
+                    input_img = torch.cat((cover_input, secret_input), 1)
+
+                    #################
+                    #    forward:   #
+                    #################
+                    output = net(input_img)
+                    output_steg = output.narrow(1, 0, 4 * c.channels_in)
+                    steg = iwt(output_steg)
+                    output_z = output.narrow(1, 4 * c.channels_in, output.shape[1] - 4 * c.channels_in)
+                    # output_z = gauss_noise(output_z.shape)
+                    output_z = binary_noise(output_z.shape)
+
+                    test_stego_noise_img = test_noise_layer(steg.clone()).to(device)
+
+                    #################
+                    #   backward:   #
+                    #################
+                    output_steg = output_steg.to(device)
+                    output_rev = torch.cat((dwt(test_stego_noise_img), output_z), 1)
+                    output_image = net(output_rev, rev=True)
+                    secret_rev = output_image.narrow(1, 4 * c.channels_in, output_image.shape[1] - 4 * c.channels_in)
+                    secret_rev = iwt(secret_rev)
+
+                    secret_rev = secret_rev.cpu().numpy().squeeze() * 255
+                    np.clip(secret_rev, 0, 255)
+                    secret = secret.cpu().numpy().squeeze() * 255
+                    np.clip(secret, 0, 255)
+                    cover = cover.cpu().numpy().squeeze() * 255
+                    np.clip(cover, 0, 255)
+                    steg = steg.cpu().numpy().squeeze() * 255
+                    np.clip(steg, 0, 255)
+                    
+                    # Convert numpy arrays to PyTorch tensors and move to device
+                    secret_rev = torch.from_numpy(secret_rev).float().to(device)
+                    secret = torch.from_numpy(secret).float().to(device)
+                    cover = torch.from_numpy(cover).float().to(device)
+                    steg = torch.from_numpy(steg).float().to(device)
+                    
+                    psnr_temp = computePSNR(secret_rev, secret)
+                    psnr_s.append(psnr_temp)
+                    psnr_temp_c = computePSNR(cover, steg)
+                    psnr_c.append(psnr_temp_c)
+
+                writer.add_scalars("PSNR_S", {"average psnr": np.mean(psnr_s)}, i_epoch)
+                writer.add_scalars("PSNR_C", {"average psnr": np.mean(psnr_c)}, i_epoch)
+
+        # Log each loss term for each epoch
+        writer.add_scalar("Train/Total_Loss", epoch_losses[0], i_epoch)
+        writer.add_scalar("Train/Guide_Loss", epoch_losses[1], i_epoch)
+        writer.add_scalar("Train/Reconstruction_Loss", epoch_losses[2], i_epoch)
+        writer.add_scalar("Train/Low_Frequency_Loss", epoch_losses[3], i_epoch)
+
+        viz.show_loss(epoch_losses)
+        # writer.add_scalars("Train", {"Train_Loss": epoch_losses[0]}, i_epoch)
+
+        if i_epoch > 0 and (i_epoch % c.SAVE_freq) == 0:
+            torch.save({'opt': optim.state_dict(),
+                        'net': net.state_dict()}, c.MODEL_PATH + 'model_checkpoint_%.5i' % i_epoch + '.pt')
+        weight_scheduler.step()
+
+    torch.save({'opt': optim.state_dict(),
+                'net': net.state_dict()}, c.MODEL_PATH + 'model_test' + '.pt')
+    writer.close()
+
+except:
+    if c.checkpoint_on_error:
+        torch.save({'opt': optim.state_dict(),
+                    'net': net.state_dict()}, c.MODEL_PATH + 'model_ABORT' + '.pt')
+    raise
+
+finally:
+    viz.signal_stop()
